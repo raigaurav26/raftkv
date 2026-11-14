@@ -1,0 +1,59 @@
+# raftkv
+
+[![CI](https://github.com/raigaurav26/raftkv/actions/workflows/ci.yml/badge.svg)](https://github.com/raigaurav26/raftkv/actions/workflows/ci.yml)
+
+A small replicated key-value store in plain Java, built on the
+[Raft consensus algorithm](https://raft.github.io/raft.pdf). Three or five nodes keep the same
+data; the cluster keeps accepting writes as long as a majority is up, and never loses a write it
+has acknowledged.
+
+The goal is a readable implementation of the core of Raft with tests that try hard to break it:
+an in-process harness that partitions the network, drops and delays messages, and crashes nodes,
+then checks Raft's safety properties.
+
+## Features (planned)
+
+- Leader election with randomized timeouts
+- Log replication with fast conflict back-off
+- Durable log and term/vote on disk, with CRC checks and crash recovery
+- Snapshots, log compaction and InstallSnapshot
+- HTTP API: `PUT`, `GET`, `DELETE /kv/{key}`, followers redirect to the leader
+- Fault-injection test harness (partitions, drops, delays, crashes)
+- Benchmark and a Docker Compose three-node cluster
+
+## Tech
+
+Java 17, Maven, JUnit 5. No frameworks in the core, so the consensus code stays easy to follow.
+
+## Build
+
+```bash
+mvn verify
+```
+
+## Project layout
+
+```
+src/main/java/com/raftkv
+├── core   NodeId, Role (state machine), Command, LogEntry, PersistentState (term + vote)
+└── log    RaftLog and the in-memory implementation of the AppendEntries log check
+```
+
+## Roadmap
+
+See [docs/PLAN.md](docs/PLAN.md) for the day-by-day plan.
+
+- [x] Day 1: skeleton, core types, in-memory log, CI
+- [ ] Day 2: RPC messages and transport
+- [ ] Day 3: leader election
+- [ ] Day 4: log replication and commit
+- [ ] Day 5: key-value state machine
+- [ ] Day 6: persistent log and state
+- [ ] Day 7: crash recovery
+- [ ] Day 8: snapshots and log compaction
+- [ ] Day 9: InstallSnapshot
+- [ ] Day 10: HTTP API and node-to-node transport
+- [ ] Day 11: fault-injection harness
+- [ ] Day 12: runnable cluster (scripts, Docker Compose)
+- [ ] Day 13: architecture diagram and benchmark
+- [ ] Day 14: polish
