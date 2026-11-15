@@ -35,8 +35,10 @@ mvn verify
 
 ```
 src/main/java/com/raftkv
-├── core   NodeId, Role (state machine), Command, LogEntry, PersistentState (term + vote)
-└── log    RaftLog and the in-memory implementation of the AppendEntries log check
+├── core       NodeId, Role (state machine), Command, LogEntry, PersistentState (term + vote)
+├── log        RaftLog and the in-memory implementation of the AppendEntries log check
+├── rpc        RequestVote, VoteResponse, AppendEntries, AppendResponse (with fast back-off hint)
+└── transport  Transport interface and a deterministic in-memory network with partitions and drops
 ```
 
 ## Roadmap
@@ -44,7 +46,7 @@ src/main/java/com/raftkv
 See [docs/PLAN.md](docs/PLAN.md) for the day-by-day plan.
 
 - [x] Day 1: skeleton, core types, in-memory log, CI
-- [ ] Day 2: RPC messages and transport
+- [x] Day 2: RPC messages and transport
 - [ ] Day 3: leader election
 - [ ] Day 4: log replication and commit
 - [ ] Day 5: key-value state machine
