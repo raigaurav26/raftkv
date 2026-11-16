@@ -23,7 +23,15 @@ then checks Raft's safety properties.
 
 ## Tech
 
-Java 17, Maven, JUnit 5. No frameworks in the core, so the consensus code stays easy to follow.
+Java 21, Maven, JUnit 5. No frameworks in the core, so the consensus code stays easy to follow.
+
+## Design notes
+
+- **No threads or clocks in the consensus code.** `RaftNode` only reacts to `tick()` and
+  `onMessage()`. Tests drive a whole cluster from one thread with a seeded random source, so a
+  failing seed replays exactly. The runtime will call the same methods from a single event loop.
+- **Term and vote are saved before any reply leaves the node**, so a restart can never lead to
+  two votes in one term.
 
 ## Build
 
@@ -36,6 +44,7 @@ mvn verify
 ```
 src/main/java/com/raftkv
 ├── core       NodeId, Role (state machine), Command, LogEntry, PersistentState (term + vote)
+├── node       RaftNode (election rules, tick-driven timers), RaftConfig, StateStore
 ├── log        RaftLog and the in-memory implementation of the AppendEntries log check
 ├── rpc        RequestVote, VoteResponse, AppendEntries, AppendResponse (with fast back-off hint)
 └── transport  Transport interface and a deterministic in-memory network with partitions and drops
@@ -47,7 +56,7 @@ See [docs/PLAN.md](docs/PLAN.md) for the day-by-day plan.
 
 - [x] Day 1: skeleton, core types, in-memory log, CI
 - [x] Day 2: RPC messages and transport
-- [ ] Day 3: leader election
+- [x] Day 3: leader election
 - [ ] Day 4: log replication and commit
 - [ ] Day 5: key-value state machine
 - [ ] Day 6: persistent log and state
