@@ -1,5 +1,7 @@
 package com.raftkv.node;
 
+import com.raftkv.core.Command;
+import com.raftkv.core.LogEntry;
 import com.raftkv.core.NodeId;
 import com.raftkv.core.PersistentState;
 import com.raftkv.core.Role;
@@ -11,7 +13,10 @@ import com.raftkv.rpc.RequestVote;
 import com.raftkv.rpc.VoteResponse;
 import com.raftkv.transport.Transport;
 
+import java.util.HashMap;
 import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Random;
@@ -23,8 +28,8 @@ import java.util.Set;
  * through {@link #onMessage}, so the caller decides the order of every event. The runtime
  * serialises all calls on one thread; the test cluster calls it directly.
  *
- * <p>Day 3 covers leader election (Raft paper, section 5.2) and the follower side of
- * AppendEntries. The leader side of replication comes on Day 4.
+ * <p>Covers leader election (Raft paper, section 5.2) and log replication with the commit
+ * rule (sections 5.3 and 5.4). Applying committed entries to the key-value store comes next.
  */
 public final class RaftNode {
 
@@ -41,6 +46,11 @@ public final class RaftNode {
     private Role role = Role.FOLLOWER;
     private NodeId leaderId;
     private final Set<NodeId> votes = new HashSet<>();
+    private long commitIndex;
+
+    // Leader-only, rebuilt on every election (figure 2, "volatile state on leaders").
+    private final Map<NodeId, Long> nextIndex = new HashMap<>();
+    private final Map<NodeId, Long> matchIndex = new HashMap<>();
 
     private int electionElapsed;
     private int electionTimeout;
@@ -69,7 +79,7 @@ public final class RaftNode {
         if (role == Role.LEADER) {
             if (++heartbeatElapsed >= config.heartbeatInterval()) {
                 heartbeatElapsed = 0;
-                broadcastHeartbeat();
+                broadcastAppend();
             }
         } else if (++electionElapsed >= electionTimeout) {
             startElection();
@@ -105,8 +115,18 @@ public final class RaftNode {
         role = role.moveTo(Role.LEADER);
         leaderId = id;
         heartbeatElapsed = 0;
+        nextIndex.clear();
+        matchIndex.clear();
+        for (NodeId peer : peers) {
+            nextIndex.put(peer, log.lastIndex() + 1);
+            matchIndex.put(peer, 0L);
+        }
         listener.roleChanged(id, role, term());
-        broadcastHeartbeat(); // announce right away so other candidates step down
+        // A leader may only count replicas for entries of its own term (section 5.4.2), so it
+        // appends an empty entry at once; committing it also commits everything before it.
+        log.append(term(), Command.noop());
+        advanceCommitIndex(); // single-node cluster commits on its own
+        broadcastAppend(); // also announces the new leader so other candidates step down
     }
 
     private void becomeFollower(long newTerm, NodeId knownLeader) {
@@ -115,6 +135,8 @@ public final class RaftNode {
         if (changed) role = role.moveTo(Role.FOLLOWER);
         leaderId = knownLeader;
         votes.clear();
+        nextIndex.clear();
+        matchIndex.clear();
         resetElectionTimer();
         if (changed) listener.roleChanged(id, role, term());
     }
@@ -123,9 +145,83 @@ public final class RaftNode {
         return granted.size() * 2 > peers.size() + 1;
     }
 
-    private void broadcastHeartbeat() {
-        AppendEntries hb = AppendEntries.heartbeat(term(), id, log.lastIndex(), log.lastTerm(), 0);
-        for (NodeId peer : peers) transport.send(id, peer, hb);
+    // ---------------------------------------------------------------- replication (leader)
+
+    /**
+     * Appends a client command to the leader's log and starts replicating it. The entry is
+     * not durable in the cluster until it is committed; callers watch the commit index.
+     *
+     * @throws NotLeaderException on a follower or candidate, with the leader if known
+     */
+    public LogEntry propose(Command command) {
+        if (role != Role.LEADER) throw new NotLeaderException(id, leaderId);
+        LogEntry entry = log.append(term(), command);
+        advanceCommitIndex();
+        for (NodeId peer : peers) {
+            // Only peers that are caught up get a message now; the rest are mid-probe and
+            // will get entries with their next reply or heartbeat.
+            if (nextIndex.get(peer) == entry.index()) sendAppend(peer);
+        }
+        return entry;
+    }
+
+    /** Sends every follower what it is missing. With nothing missing this is a heartbeat. */
+    private void broadcastAppend() {
+        for (NodeId peer : peers) sendAppend(peer);
+    }
+
+    private void sendAppend(NodeId peer) {
+        long next = nextIndex.get(peer);
+        long prevIndex = next - 1;
+        long prevTerm = log.termAt(prevIndex).orElseThrow();
+        List<LogEntry> entries = log.entriesFrom(next, config.maxEntriesPerAppend());
+        transport.send(id, peer, new AppendEntries(term(), id, prevIndex, prevTerm, entries, commitIndex));
+    }
+
+    private void handleAppendResponse(NodeId from, AppendResponse ar) {
+        if (role != Role.LEADER || ar.term() != term()) return; // stale reply
+        if (ar.success()) {
+            // max(): replies can arrive out of order, and matchIndex must never go backwards.
+            long match = Math.max(matchIndex.get(from), ar.matchIndex());
+            matchIndex.put(from, match);
+            nextIndex.put(from, Math.max(nextIndex.get(from), match + 1));
+            advanceCommitIndex();
+            if (nextIndex.get(from) <= log.lastIndex()) sendAppend(from); // keep streaming
+        } else {
+            // Jump back to the follower's hint, but never below what it already matched and
+            // always at least one step, so the probe makes progress.
+            long current = nextIndex.get(from);
+            long next = Math.max(matchIndex.get(from) + 1, Math.min(current - 1, ar.conflictIndex()));
+            if (next < current) {
+                nextIndex.put(from, next);
+                sendAppend(from);
+            }
+        }
+    }
+
+    /**
+     * Moves the commit index to the highest N such that a majority has the entry at N and that
+     * entry is from the current term (figure 2, last rule for leaders). Entries from earlier
+     * terms are never committed by counting replicas; they commit along with a later entry
+     * from this term. Skipping that check is the bug shown in figure 8 of the paper.
+     */
+    private void advanceCommitIndex() {
+        for (long n = log.lastIndex(); n > commitIndex; n--) {
+            if (log.termAt(n).orElseThrow() != term()) break; // older terms below; stop
+            int replicas = 1; // the leader itself
+            for (long m : matchIndex.values()) if (m >= n) replicas++;
+            if (replicas * 2 > peers.size() + 1) {
+                setCommitIndex(n);
+                return;
+            }
+        }
+    }
+
+    private void setCommitIndex(long index) {
+        if (index > commitIndex) {
+            commitIndex = index;
+            listener.committed(id, commitIndex);
+        }
     }
 
     // ---------------------------------------------------------------- messages
@@ -140,7 +236,7 @@ public final class RaftNode {
             case RequestVote rv -> handleRequestVote(from, rv);
             case VoteResponse vr -> handleVoteResponse(from, vr);
             case AppendEntries ae -> handleAppendEntries(from, ae);
-            case AppendResponse ar -> { } // leader-side replication: Day 4
+            case AppendResponse ar -> handleAppendResponse(from, ar);
         }
     }
 
@@ -175,6 +271,9 @@ public final class RaftNode {
         resetElectionTimer();
 
         if (log.appendFromLeader(ae.prevLogIndex(), ae.prevLogTerm(), ae.entries())) {
+            // Only up to the last entry this message vouched for: anything after it in our log
+            // may still be a stale suffix the leader has not overwritten yet.
+            setCommitIndex(Math.min(ae.leaderCommit(), ae.lastNewIndex()));
             transport.send(id, from, AppendResponse.success(term(), ae.lastNewIndex()));
         } else {
             transport.send(id, from, AppendResponse.conflict(term(), conflictHint(ae.prevLogIndex())));
@@ -228,6 +327,15 @@ public final class RaftNode {
 
     public RaftLog log() {
         return log;
+    }
+
+    public long commitIndex() {
+        return commitIndex;
+    }
+
+    /** Leader view of how far {@code peer}'s log is known to match; empty on non-leaders. */
+    public Optional<Long> matchIndexOf(NodeId peer) {
+        return Optional.ofNullable(matchIndex.get(peer));
     }
 
     int electionTimeout() {

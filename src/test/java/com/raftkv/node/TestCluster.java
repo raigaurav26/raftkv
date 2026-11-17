@@ -1,5 +1,7 @@
 package com.raftkv.node;
 
+import com.raftkv.core.Command;
+import com.raftkv.core.LogEntry;
 import com.raftkv.core.NodeId;
 import com.raftkv.core.Role;
 import com.raftkv.log.InMemoryRaftLog;
@@ -30,6 +32,8 @@ final class TestCluster {
     final Map<NodeId, RaftNode> nodes = new LinkedHashMap<>();
     final Map<NodeId, InMemoryStateStore> stores = new HashMap<>();
     private final Map<Long, Set<NodeId>> leadersByTerm = new HashMap<>();
+    /** Every entry any node ever reported committed, by index. Must never change. */
+    private final Map<Long, LogEntry> committed = new HashMap<>();
     private final RaftConfig config;
     private final Random seeds;
     private long steps;
@@ -57,6 +61,11 @@ final class TestCluster {
             @Override
             public void roleChanged(NodeId node, Role role, long term) {
                 if (role == Role.LEADER) leadersByTerm.computeIfAbsent(term, t -> new HashSet<>()).add(node);
+            }
+
+            @Override
+            public void committed(NodeId node, long commitIndex) {
+                recordCommitted(nodes.get(node), commitIndex);
             }
         };
         return new RaftNode(id, peers, network, new InMemoryRaftLog(), store, config,
@@ -114,6 +123,70 @@ final class TestCluster {
                         && n.term() == l.term() && n.leaderId().equals(Optional.of(l.id())))))
                 .orElse(false), maxSteps, "stable leader among " + among);
         return leaderAmong(among).orElseThrow();
+    }
+
+    /**
+     * Called whenever a node advances its commit index. Checks that the entries it now calls
+     * committed agree with what any node called committed before (state machine safety).
+     */
+    private void recordCommitted(RaftNode node, long commitIndex) {
+        if (node == null) return; // still constructing
+        for (long i = 1; i <= commitIndex; i++) {
+            LogEntry mine = node.log().entry(i).orElseThrow(
+                    () -> new AssertionError(node.id() + " committed past the end of its log"));
+            LogEntry earlier = committed.putIfAbsent(i, mine);
+            if (earlier != null && !earlier.equals(mine)) {
+                throw new AssertionError("index " + mine.index() + " committed as " + earlier
+                        + " and later as " + mine + " on " + node.id());
+            }
+        }
+    }
+
+    /** Proposes on the current leader. Fails if there is none. */
+    LogEntry propose(Command command) {
+        List<RaftNode> l = leaders();
+        if (l.isEmpty()) throw new AssertionError("no leader; " + describe());
+        return l.stream().max(java.util.Comparator.comparingLong(RaftNode::term)).orElseThrow().propose(command);
+    }
+
+    void awaitCommitEverywhere(long index, int maxSteps) {
+        runUntil(() -> nodes.values().stream().allMatch(n -> n.commitIndex() >= index), maxSteps,
+                "commit of index " + index + " on every node");
+    }
+
+    Map<Long, LogEntry> committed() {
+        return committed;
+    }
+
+    /** Leader completeness: every entry ever committed is in every node's log, unchanged. */
+    void assertCommittedEverywhere() {
+        for (RaftNode n : nodes.values()) {
+            committed.forEach((i, e) -> {
+                if (!n.log().entry(i).equals(Optional.of(e))) {
+                    throw new AssertionError(n.id() + " lost committed entry " + e + "; has " + n.log().entry(i));
+                }
+            });
+        }
+    }
+
+    /** Log matching: if two logs agree on the term at an index, they agree on everything before it. */
+    void assertLogMatching() {
+        List<RaftNode> all = List.copyOf(nodes.values());
+        for (int a = 0; a < all.size(); a++) {
+            for (int b = a + 1; b < all.size(); b++) {
+                RaftNode x = all.get(a), y = all.get(b);
+                long upTo = Math.min(x.log().lastIndex(), y.log().lastIndex());
+                for (long i = upTo; i >= 1; i--) {
+                    if (x.log().termAt(i).equals(y.log().termAt(i))) {
+                        if (!x.log().entriesFrom(1, (int) i).equals(y.log().entriesFrom(1, (int) i))) {
+                            throw new AssertionError("logs of " + x.id() + " and " + y.id()
+                                    + " agree at " + i + " but differ before it");
+                        }
+                        break;
+                    }
+                }
+            }
+        }
     }
 
     /** Election safety: no term ever had two leaders. */
