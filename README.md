@@ -38,6 +38,10 @@ Java 21, Maven, JUnit 5. No frameworks in the core, so the consensus code stays 
 - **Tests check Raft's safety properties directly**: one leader per term, log matching, and
   that no committed entry ever changes or disappears, over hundreds of seeded runs with random
   partitions and message loss.
+- **Linearizable reads without writing to the log.** A read waits until the leader has
+  confirmed with a majority, after the read arrived, that it still leads (read-index from
+  Ongaro's thesis, section 6.4). A leader cut off from the cluster can never serve a stale
+  value. Heartbeats carry a sequence number so a late reply to an old message cannot count.
 - **Term and vote are saved before any reply leaves the node**, so a restart can never lead to
   two votes in one term.
 
@@ -52,7 +56,8 @@ mvn verify
 ```
 src/main/java/com/raftkv
 ├── core       NodeId, Role (state machine), Command, LogEntry, PersistentState (term + vote)
-├── node       RaftNode (election, replication, commit rule), RaftConfig, StateStore
+├── node       RaftNode (election, replication, commit rule, read barrier), RaftConfig, StateStore
+├── kv         KvStateMachine (the map), KvService (put / get / delete as futures)
 ├── log        RaftLog and the in-memory implementation of the AppendEntries log check
 ├── rpc        RequestVote, VoteResponse, AppendEntries, AppendResponse (with fast back-off hint)
 └── transport  Transport interface and a deterministic in-memory network with partitions and drops
@@ -66,7 +71,7 @@ See [docs/PLAN.md](docs/PLAN.md) for the day-by-day plan.
 - [x] Day 2: RPC messages and transport
 - [x] Day 3: leader election
 - [x] Day 4: log replication and commit
-- [ ] Day 5: key-value state machine
+- [x] Day 5: key-value state machine
 - [ ] Day 6: persistent log and state
 - [ ] Day 7: crash recovery
 - [ ] Day 8: snapshots and log compaction

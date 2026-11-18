@@ -49,7 +49,7 @@ class VoteRulesTest {
             @Override public void unregister(NodeId n) { }
             @Override public void send(NodeId from, NodeId to, RaftMessage m) { sent.add(new Sent(to, m)); }
         };
-        return new RaftNode(ME, Set.of(A, B), capture, log, store, RaftConfig.DEFAULT, new Random(0), NodeListener.NONE);
+        return new RaftNode(ME, Set.of(A, B), capture, log, store, new com.raftkv.kv.KvStateMachine(), RaftConfig.DEFAULT, new Random(0), NodeListener.NONE);
     }
 
     private <T extends RaftMessage> T lastReply(Class<T> type) {

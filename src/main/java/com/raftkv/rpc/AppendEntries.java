@@ -9,6 +9,10 @@ import java.util.Objects;
 /**
  * Sent by the leader to replicate entries, and with no entries as a heartbeat
  * (Raft paper, figure 2).
+ *
+ * <p>{@code seq} is a number the leader increases with every message it sends. The follower
+ * echoes it in its reply, which lets the leader tell a fresh acknowledgement from a late reply
+ * to an older message. Linearizable reads rely on that (see {@code RaftNode.readBarrier}).
  */
 public record AppendEntries(
         long term,
@@ -16,12 +20,18 @@ public record AppendEntries(
         long prevLogIndex,
         long prevLogTerm,
         List<LogEntry> entries,
-        long leaderCommit) implements RaftMessage {
+        long leaderCommit,
+        long seq) implements RaftMessage {
+
+    public AppendEntries(long term, NodeId leaderId, long prevLogIndex, long prevLogTerm,
+                         List<LogEntry> entries, long leaderCommit) {
+        this(term, leaderId, prevLogIndex, prevLogTerm, entries, leaderCommit, 0);
+    }
 
     public AppendEntries {
         if (term < 1) throw new IllegalArgumentException("term must be >= 1");
         Objects.requireNonNull(leaderId, "leaderId");
-        if (prevLogIndex < 0 || prevLogTerm < 0 || leaderCommit < 0) {
+        if (prevLogIndex < 0 || prevLogTerm < 0 || leaderCommit < 0 || seq < 0) {
             throw new IllegalArgumentException("indexes and terms must be >= 0");
         }
         entries = List.copyOf(entries);

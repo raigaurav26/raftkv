@@ -4,6 +4,8 @@ import com.raftkv.core.Command;
 import com.raftkv.core.LogEntry;
 import com.raftkv.core.NodeId;
 import com.raftkv.core.Role;
+import com.raftkv.kv.KvService;
+import com.raftkv.kv.KvStateMachine;
 import com.raftkv.log.InMemoryRaftLog;
 import com.raftkv.transport.InMemoryNetwork;
 
@@ -31,6 +33,7 @@ final class TestCluster {
     final InMemoryNetwork network = new InMemoryNetwork();
     final Map<NodeId, RaftNode> nodes = new LinkedHashMap<>();
     final Map<NodeId, InMemoryStateStore> stores = new HashMap<>();
+    final Map<NodeId, KvStateMachine> kvs = new HashMap<>();
     private final Map<Long, Set<NodeId>> leadersByTerm = new HashMap<>();
     /** Every entry any node ever reported committed, by index. Must never change. */
     private final Map<Long, LogEntry> committed = new HashMap<>();
@@ -68,12 +71,30 @@ final class TestCluster {
                 recordCommitted(nodes.get(node), commitIndex);
             }
         };
-        return new RaftNode(id, peers, network, new InMemoryRaftLog(), store, config,
+        KvStateMachine kv = new KvStateMachine();
+        kvs.put(id, kv);
+        return new RaftNode(id, peers, network, new InMemoryRaftLog(), store, kv, config,
                 new Random(seeds.nextLong()), recorder);
     }
 
     RaftNode node(String id) {
         return nodes.get(NodeId.of(id));
+    }
+
+    KvService kv(NodeId id) {
+        return new KvService(nodes.get(id), kvs.get(id));
+    }
+
+    /** Every node has applied the same entries and holds the same map. */
+    void assertStateMachinesAgree() {
+        long applied = nodes.values().iterator().next().lastApplied();
+        Map<String, String> data = kvs.values().iterator().next().snapshot();
+        for (RaftNode n : nodes.values()) {
+            if (n.lastApplied() != applied || !kvs.get(n.id()).snapshot().equals(data)) {
+                throw new AssertionError(n.id() + " applied " + n.lastApplied() + " " + kvs.get(n.id()).snapshot()
+                        + " but others applied " + applied + " " + data);
+            }
+        }
     }
 
     List<NodeId> ids() {

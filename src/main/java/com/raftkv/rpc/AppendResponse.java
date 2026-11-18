@@ -10,11 +10,18 @@ package com.raftkv.rpc;
  * <p>On failure, {@code conflictIndex} is a hint for where the leader should retry from: the
  * follower's {@code lastIndex + 1} when it is too short, or the first index of the conflicting
  * term. This skips a whole term per round trip instead of one entry (section 5.3, "fast back-off").
+ *
+ * <p>{@code seq} echoes the {@link AppendEntries#seq()} this reply answers.
  */
-public record AppendResponse(long term, boolean success, long matchIndex, long conflictIndex)
+public record AppendResponse(long term, boolean success, long matchIndex, long conflictIndex, long seq)
         implements RaftMessage {
 
+    public AppendResponse(long term, boolean success, long matchIndex, long conflictIndex) {
+        this(term, success, matchIndex, conflictIndex, 0);
+    }
+
     public AppendResponse {
+        if (seq < 0) throw new IllegalArgumentException("seq must be >= 0");
         if (term < 0) throw new IllegalArgumentException("term must be >= 0");
         if (success && conflictIndex != 0) {
             throw new IllegalArgumentException("a successful reply has no conflict index");
@@ -33,6 +40,10 @@ public record AppendResponse(long term, boolean success, long matchIndex, long c
 
     public static AppendResponse conflict(long term, long conflictIndex) {
         return new AppendResponse(term, false, 0, Math.max(1, conflictIndex));
+    }
+
+    public AppendResponse withSeq(long seq) {
+        return new AppendResponse(term, success, matchIndex, conflictIndex, seq);
     }
 
     /** Rejected because the leader's term is stale; the leader will step down on seeing {@code term}. */

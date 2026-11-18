@@ -36,7 +36,7 @@ class CommitRuleTest {
             @Override public void unregister(NodeId n) { }
             @Override public void send(NodeId from, NodeId to, RaftMessage m) { sent.add(m); }
         };
-        return new RaftNode(ME, Set.of(A, B), capture, log, store, RaftConfig.DEFAULT, new Random(0), NodeListener.NONE);
+        return new RaftNode(ME, Set.of(A, B), capture, log, store, new com.raftkv.kv.KvStateMachine(), RaftConfig.DEFAULT, new Random(0), NodeListener.NONE);
     }
 
     private RaftNode electedLeader() {
