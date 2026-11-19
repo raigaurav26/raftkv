@@ -43,7 +43,12 @@ Java 21, Maven, JUnit 5. No frameworks in the core, so the consensus code stays 
   Ongaro's thesis, section 6.4). A leader cut off from the cluster can never serve a stale
   value. Heartbeats carry a sequence number so a late reply to an old message cannot count.
 - **Term and vote are saved before any reply leaves the node**, so a restart can never lead to
-  two votes in one term.
+  two votes in one term. The state file is replaced atomically (temp file, fsync, rename,
+  fsync the directory).
+- **The log file tells a crash from corruption.** Every record has a length and a CRC32. A
+  half-written last record can only come from a crash mid-write, was never acknowledged, and
+  is trimmed on startup. A complete record with a bad checksum is real corruption, and the node
+  refuses to start instead of guessing. Each AppendEntries batch costs one fsync.
 
 ## Build
 
@@ -57,8 +62,9 @@ mvn verify
 src/main/java/com/raftkv
 ├── core       NodeId, Role (state machine), Command, LogEntry, PersistentState (term + vote)
 ├── node       RaftNode (election, replication, commit rule, read barrier), RaftConfig, StateStore
+├── storage    FileRaftLog (length + CRC32 records, fsync), FileStateStore (atomic rename)
 ├── kv         KvStateMachine (the map), KvService (put / get / delete as futures)
-├── log        RaftLog and the in-memory implementation of the AppendEntries log check
+├── log        RaftLog, the shared AppendEntries log rules, in-memory log
 ├── rpc        RequestVote, VoteResponse, AppendEntries, AppendResponse (with fast back-off hint)
 └── transport  Transport interface and a deterministic in-memory network with partitions and drops
 ```
@@ -72,7 +78,7 @@ See [docs/PLAN.md](docs/PLAN.md) for the day-by-day plan.
 - [x] Day 3: leader election
 - [x] Day 4: log replication and commit
 - [x] Day 5: key-value state machine
-- [ ] Day 6: persistent log and state
+- [x] Day 6: persistent log and state
 - [ ] Day 7: crash recovery
 - [ ] Day 8: snapshots and log compaction
 - [ ] Day 9: InstallSnapshot
