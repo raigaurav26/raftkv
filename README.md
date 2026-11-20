@@ -45,6 +45,11 @@ Java 21, Maven, JUnit 5. No frameworks in the core, so the consensus code stays 
 - **Term and vote are saved before any reply leaves the node**, so a restart can never lead to
   two votes in one term. The state file is replaced atomically (temp file, fsync, rename,
   fsync the directory).
+- **Crash tests restart nodes from their files.** The test cluster can kill a node as a power
+  cut would (memory gone, queued messages lost, optionally a half-written last record on disk)
+  and start it again with an empty state machine. The log is re-applied from the leader's commit
+  index. Random runs mix crashes, partitions and message loss, and check every commit as it
+  happens.
 - **The log file tells a crash from corruption.** Every record has a length and a CRC32. A
   half-written last record can only come from a crash mid-write, was never acknowledged, and
   is trimmed on startup. A complete record with a bad checksum is real corruption, and the node
@@ -79,7 +84,7 @@ See [docs/PLAN.md](docs/PLAN.md) for the day-by-day plan.
 - [x] Day 4: log replication and commit
 - [x] Day 5: key-value state machine
 - [x] Day 6: persistent log and state
-- [ ] Day 7: crash recovery
+- [x] Day 7: crash recovery
 - [ ] Day 8: snapshots and log compaction
 - [ ] Day 9: InstallSnapshot
 - [ ] Day 10: HTTP API and node-to-node transport

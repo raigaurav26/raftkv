@@ -7,8 +7,15 @@ import com.raftkv.core.Role;
 import com.raftkv.kv.KvService;
 import com.raftkv.kv.KvStateMachine;
 import com.raftkv.log.InMemoryRaftLog;
+import com.raftkv.log.RaftLog;
+import com.raftkv.storage.FileRaftLog;
+import com.raftkv.storage.FileStateStore;
 import com.raftkv.transport.InMemoryNetwork;
 
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -32,7 +39,12 @@ final class TestCluster {
 
     final InMemoryNetwork network = new InMemoryNetwork();
     final Map<NodeId, RaftNode> nodes = new LinkedHashMap<>();
-    final Map<NodeId, InMemoryStateStore> stores = new HashMap<>();
+    final Map<NodeId, StateStore> stores = new HashMap<>();
+    final Map<NodeId, RaftLog> logs = new HashMap<>();
+    final Set<NodeId> down = new HashSet<>();
+    private final List<NodeId> allIds = new ArrayList<>();
+    private final Path dataDir;   // null = in-memory nodes that cannot be restarted
+    private final boolean fsync;
     final Map<NodeId, KvStateMachine> kvs = new HashMap<>();
     private final Map<Long, Set<NodeId>> leadersByTerm = new HashMap<>();
     /** Every entry any node ever reported committed, by index. Must never change. */
@@ -46,20 +58,94 @@ final class TestCluster {
     }
 
     TestCluster(int size, long seed, RaftConfig config) {
+        this(size, seed, config, null, true);
+    }
+
+    /** A cluster whose nodes keep their log, term and vote in files under {@code dataDir}. */
+    static TestCluster durable(int size, long seed, Path dataDir) {
+        return new TestCluster(size, seed, RaftConfig.DEFAULT, dataDir, true);
+    }
+
+    static TestCluster durable(int size, long seed, Path dataDir, boolean fsync) {
+        return new TestCluster(size, seed, RaftConfig.DEFAULT, dataDir, fsync);
+    }
+
+    private TestCluster(int size, long seed, RaftConfig config, Path dataDir, boolean fsync) {
         this.config = config;
         this.seeds = new Random(seed);
-        List<NodeId> ids = new ArrayList<>();
-        for (int i = 1; i <= size; i++) ids.add(NodeId.of("n" + i));
-        for (NodeId id : ids) {
-            Set<NodeId> peers = new HashSet<>(ids);
-            peers.remove(id);
-            InMemoryStateStore store = new InMemoryStateStore();
-            stores.put(id, store);
-            nodes.put(id, newNode(id, peers, store));
+        this.dataDir = dataDir;
+        this.fsync = fsync;
+        for (int i = 1; i <= size; i++) allIds.add(NodeId.of("n" + i));
+        for (NodeId id : allIds) nodes.put(id, startNode(id));
+    }
+
+    private Path logFile(NodeId id) {
+        return dataDir.resolve(id.value()).resolve("raft.log");
+    }
+
+    private RaftNode startNode(NodeId id) {
+        Set<NodeId> peers = new HashSet<>(allIds);
+        peers.remove(id);
+        StateStore store;
+        RaftLog log;
+        if (dataDir == null) {
+            store = new InMemoryStateStore();
+            log = new InMemoryRaftLog();
+        } else {
+            store = new FileStateStore(dataDir.resolve(id.value()).resolve("state"));
+            log = new FileRaftLog(logFile(id), fsync);
+        }
+        stores.put(id, store);
+        logs.put(id, log);
+        return newNode(id, peers, store, log);
+    }
+
+    /**
+     * Kills a node the way a power cut would: it stops at once, its memory is gone, queued
+     * messages addressed to it are lost, and only what it fsynced stays on disk. With
+     * {@code tornWrite} the file also ends in the start of a record that never finished,
+     * as if the machine died halfway through a write (which was therefore never acknowledged).
+     */
+    void crash(NodeId id, boolean tornWrite) {
+        if (dataDir == null) throw new IllegalStateException("only durable clusters can crash nodes");
+        if (!nodes.containsKey(id)) throw new IllegalStateException(id + " is already down");
+        network.unregister(id);
+        nodes.remove(id);
+        ((FileRaftLog) logs.remove(id)).close();
+        stores.remove(id);
+        kvs.remove(id);
+        down.add(id);
+        if (tornWrite) {
+            try {
+                Files.write(logFile(id), new byte[]{0, 0, 1, 0, 0x12, 0x34, 0x56, 0x78, 7, 7, 7},
+                        StandardOpenOption.APPEND);
+            } catch (IOException e) {
+                throw new AssertionError(e);
+            }
         }
     }
 
-    private RaftNode newNode(NodeId id, Set<NodeId> peers, InMemoryStateStore store) {
+    void crash(NodeId id) {
+        crash(id, false);
+    }
+
+    /** Starts the node again from whatever is on disk, with an empty state machine. */
+    RaftNode restart(NodeId id) {
+        if (!down.remove(id)) throw new IllegalStateException(id + " is not down");
+        RaftNode node = startNode(id);
+        nodes.put(id, node);
+        return node;
+    }
+
+    void restartAll() {
+        for (NodeId id : List.copyOf(down)) restart(id);
+    }
+
+    void closeFiles() {
+        for (RaftLog l : logs.values()) if (l instanceof FileRaftLog f) f.close();
+    }
+
+    private RaftNode newNode(NodeId id, Set<NodeId> peers, StateStore store, RaftLog log) {
         NodeListener recorder = new NodeListener() {
             @Override
             public void roleChanged(NodeId node, Role role, long term) {
@@ -73,7 +159,7 @@ final class TestCluster {
         };
         KvStateMachine kv = new KvStateMachine();
         kvs.put(id, kv);
-        return new RaftNode(id, peers, network, new InMemoryRaftLog(), store, kv, config,
+        return new RaftNode(id, peers, network, log, store, kv, config,
                 new Random(seeds.nextLong()), recorder);
     }
 
@@ -98,6 +184,10 @@ final class TestCluster {
     }
 
     List<NodeId> ids() {
+        return List.copyOf(allIds);
+    }
+
+    List<NodeId> upIds() {
         return List.copyOf(nodes.keySet());
     }
 
