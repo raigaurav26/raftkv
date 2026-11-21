@@ -17,4 +17,10 @@ public interface StateMachine {
 
     /** Index of the last applied entry, 0 if none. */
     long lastApplied();
+
+    /** The whole state as bytes. Equal states give equal bytes. */
+    byte[] snapshot();
+
+    /** Replaces the whole state with a snapshot taken after applying entry {@code lastApplied}. */
+    void restore(byte[] snapshot, long lastApplied);
 }

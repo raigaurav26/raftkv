@@ -7,8 +7,10 @@ import java.io.Closeable;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
+import java.nio.file.AtomicMoveNotSupportedException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
 import java.nio.file.StandardOpenOption;
 import java.util.ArrayList;
 import java.util.List;
@@ -24,7 +26,10 @@ import java.util.zip.CRC32;
  * Appends are written and then {@code fsync}ed before the call returns, so a follower only
  * acknowledges entries that survive a power cut. A batch from one AppendEntries costs one
  * fsync. Truncation (when a new leader overwrites a stale suffix) cuts the file at the start
- * of the first removed record, using the offsets kept in memory.
+ * of the first removed record, using the offsets kept in memory. Compaction (after a snapshot)
+ * writes the entries that remain to a new file, fsyncs it and renames it over the old one, so
+ * a crash leaves either the full old log or the compacted one. The file does not store the base
+ * explicitly: it is the first record's index minus one, and its term comes from the snapshot.
  *
  * <p>On open, the file is scanned. A last record that is cut short is the trace of a crash
  * in the middle of a write; it was never acknowledged, so it is dropped and the file is
@@ -37,7 +42,7 @@ public final class FileRaftLog extends AbstractRaftLog implements Closeable {
     static final int MAX_RECORD = 16 * 1024 * 1024;
 
     private final Path file;
-    private final FileChannel channel;
+    private FileChannel channel;
     private final List<Long> offsets = new ArrayList<>(); // offsets.get(i) = start of entry i+1
     private long size;
     private final boolean fsync;
@@ -82,8 +87,9 @@ public final class FileRaftLog extends AbstractRaftLog implements Closeable {
                 throw new CorruptStorageException(file + ": checksum mismatch at offset " + pos);
             }
             LogEntry entry = EntryCodec.decode(payload.array());
-            if (entry.index() != offsets.size() + 1L) {
-                throw new CorruptStorageException(file + ": expected index " + (offsets.size() + 1) + " got " + entry.index());
+            if (offsets.isEmpty() && entry.index() > 1) setRecoveredBase(entry.index() - 1);
+            if (entry.index() != lastIndex() + 1) {
+                throw new CorruptStorageException(file + ": expected index " + (lastIndex() + 1) + " got " + entry.index());
             }
             if (!offsets.isEmpty() && entry.term() < lastTerm()) {
                 throw new CorruptStorageException(file + ": term went backwards at index " + entry.index());
@@ -109,15 +115,58 @@ public final class FileRaftLog extends AbstractRaftLog implements Closeable {
 
     @Override
     protected void persistTruncate(long fromIndex) {
-        long cut = offsets.get((int) fromIndex - 1);
+        long cut = offsets.get((int) (fromIndex - baseIndex() - 1));
         try {
             channel.truncate(cut);
             if (fsync) channel.force(true);
         } catch (IOException e) {
             throw new StorageException("cannot truncate " + file, e);
         }
-        offsets.subList((int) fromIndex - 1, offsets.size()).clear();
+        offsets.subList((int) (fromIndex - baseIndex() - 1), offsets.size()).clear();
         size = cut;
+    }
+
+    @Override
+    protected void persistCompact(long newBaseIndex, long newBaseTerm, List<LogEntry> keep) {
+        Path temp = file.resolveSibling(file.getFileName() + ".compact");
+        try {
+            List<Long> newOffsets = new ArrayList<>(keep.size());
+            long at = 0;
+            try (FileChannel out = FileChannel.open(temp, StandardOpenOption.CREATE,
+                    StandardOpenOption.TRUNCATE_EXISTING, StandardOpenOption.WRITE)) {
+                for (LogEntry e : keep) {
+                    byte[] p = EntryCodec.encode(e);
+                    ByteBuffer buf = ByteBuffer.allocate(HEADER + p.length).putInt(p.length).putInt(crc32(p)).put(p);
+                    buf.flip();
+                    while (buf.hasRemaining()) out.write(buf);
+                    newOffsets.add(at);
+                    at += HEADER + p.length;
+                }
+                if (fsync) out.force(true);
+            }
+            channel.close();
+            try {
+                Files.move(temp, file, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
+            } catch (AtomicMoveNotSupportedException e) {
+                Files.move(temp, file, StandardCopyOption.REPLACE_EXISTING);
+            }
+            channel = FileChannel.open(file, StandardOpenOption.READ, StandardOpenOption.WRITE);
+            offsets.clear();
+            offsets.addAll(newOffsets);
+            size = at;
+            syncDirectory();
+        } catch (IOException e) {
+            throw new StorageException("cannot compact " + file, e);
+        }
+    }
+
+    private void syncDirectory() {
+        if (!fsync) return;
+        try (FileChannel dir = FileChannel.open(file.toAbsolutePath().getParent(), StandardOpenOption.READ)) {
+            dir.force(true);
+        } catch (IOException | UnsupportedOperationException ignored) {
+            // best effort; not possible on every OS
+        }
     }
 
     @Override

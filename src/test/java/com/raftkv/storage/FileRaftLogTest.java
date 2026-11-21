@@ -137,4 +137,58 @@ class FileRaftLogTest extends RaftLogContractTest {
             assertEquals(e, EntryCodec.decode(EntryCodec.encode(e)));
         }
     }
+
+    // ------------------------------------------------------------ compaction on disk
+
+    @Test
+    void compactedLogSurvivesReopenAndFileShrinks() throws IOException {
+        seed(1, 1, 1, 2, 2, 2);
+        long full = Files.size(file);
+        log.compactTo(4, 2);
+        assertTrue(Files.size(file) < full);
+        List<LogEntry> kept = log.entriesFrom(5, 10);
+
+        FileRaftLog reopened = reopen();
+        assertEquals(4, reopened.baseIndex(), "the base is the first stored index minus one");
+        assertEquals(6, reopened.lastIndex());
+        assertEquals(kept, reopened.entriesFrom(5, 10));
+        assertEquals(0, reopened.baseTerm(), "the term of the base comes from the snapshot, not the log file");
+        reopened.compactTo(4, 2);
+        assertEquals(2, reopened.baseTerm());
+        reopened.append(3, Command.noop());
+        assertEquals(7, reopen().lastIndex());
+    }
+
+    @Test
+    void fullyCompactedLogReopensEmpty() throws IOException {
+        seed(1, 1);
+        log.compactTo(2, 1);
+        assertEquals(0, Files.size(file));
+        FileRaftLog reopened = reopen();
+        assertEquals(0, reopened.lastIndex());
+        reopened.compactTo(2, 1); // what the node does on startup, from its snapshot
+        assertEquals(2, reopened.lastIndex());
+        assertEquals(1, reopened.lastTerm());
+    }
+
+    @Test
+    void truncationAfterCompactionCutsTheRightRecord() {
+        seed(1, 1, 2, 2, 2);
+        log.compactTo(2, 1);
+        log.appendFromLeader(3, 2, List.of(e(3, 4)));
+        FileRaftLog reopened = reopen();
+        assertEquals(2, reopened.baseIndex());
+        assertArrayEquals(new long[]{2, 3}, reopened.entriesFrom(3, 10).stream().mapToLong(LogEntry::term).toArray());
+    }
+
+    @Test
+    void leftoverCompactionTempFileFromACrashIsIgnored() throws IOException {
+        seed(1, 1, 1);
+        Files.write(dir.resolve("raft.log.compact"), new byte[]{9, 9, 9}); // crashed before the rename
+        FileRaftLog reopened = reopen();
+        assertEquals(3, reopened.lastIndex());
+        assertEquals(0, reopened.baseIndex());
+        reopened.compactTo(2, 1);
+        assertEquals(3, reopen().lastIndex());
+    }
 }

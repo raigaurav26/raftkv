@@ -14,4 +14,8 @@ public final class InMemoryRaftLog extends AbstractRaftLog {
     @Override
     protected void persistAppend(List<LogEntry> newEntries) {
     }
+
+    @Override
+    protected void persistCompact(long newBaseIndex, long newBaseTerm, List<LogEntry> keep) {
+    }
 }

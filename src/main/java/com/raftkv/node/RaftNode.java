@@ -5,6 +5,7 @@ import com.raftkv.core.LogEntry;
 import com.raftkv.core.NodeId;
 import com.raftkv.core.PersistentState;
 import com.raftkv.core.Role;
+import com.raftkv.core.Snapshot;
 import com.raftkv.kv.StateMachine;
 import com.raftkv.log.RaftLog;
 import com.raftkv.rpc.AppendEntries;
@@ -44,6 +45,8 @@ public final class RaftNode {
     private final RaftLog log;
     private final StateStore store;
     private final StateMachine stateMachine;
+    private final SnapshotStore snapshotStore;
+    private long snapshotIndex;
     private final RaftConfig config;
     private final Random random;
     private final NodeListener listener;
@@ -79,6 +82,12 @@ public final class RaftNode {
     public RaftNode(NodeId id, Set<NodeId> peers, Transport transport, RaftLog log,
                     StateStore store, StateMachine stateMachine, RaftConfig config, Random random,
                     NodeListener listener) {
+        this(id, peers, transport, log, store, stateMachine, new InMemorySnapshotStore(), config, random, listener);
+    }
+
+    public RaftNode(NodeId id, Set<NodeId> peers, Transport transport, RaftLog log,
+                    StateStore store, StateMachine stateMachine, SnapshotStore snapshotStore,
+                    RaftConfig config, Random random, NodeListener listener) {
         this.id = Objects.requireNonNull(id, "id");
         this.peers = Set.copyOf(peers);
         if (this.peers.contains(id)) throw new IllegalArgumentException("peers must not include the node itself");
@@ -86,12 +95,60 @@ public final class RaftNode {
         this.log = Objects.requireNonNull(log, "log");
         this.store = Objects.requireNonNull(store, "store");
         this.stateMachine = Objects.requireNonNull(stateMachine, "stateMachine");
+        this.snapshotStore = Objects.requireNonNull(snapshotStore, "snapshotStore");
         this.config = Objects.requireNonNull(config, "config");
         this.random = Objects.requireNonNull(random, "random");
         this.listener = Objects.requireNonNull(listener, "listener");
         this.state = store.load();
+        restoreFromSnapshot();
         resetElectionTimer();
         transport.register(id, this::onMessage);
+    }
+
+    // ---------------------------------------------------------------- snapshots
+
+    /**
+     * Loads the latest snapshot into the state machine. Everything it covers was committed, so
+     * the commit index starts there. If the log still holds entries the snapshot covers (a crash
+     * between saving the snapshot and trimming the log), the log is trimmed now.
+     */
+    private void restoreFromSnapshot() {
+        snapshotStore.load().ifPresent(snap -> {
+            stateMachine.restore(snap.data(), snap.lastIncludedIndex());
+            log.compactTo(snap.lastIncludedIndex(), snap.lastIncludedTerm());
+            commitIndex = snap.lastIncludedIndex();
+            snapshotIndex = snap.lastIncludedIndex();
+        });
+    }
+
+    /**
+     * Saves a snapshot of everything applied so far and trims the log. The snapshot is durable
+     * before any entry is deleted. A leader keeps the entries a follower has not acknowledged
+     * yet, because it cannot send a snapshot to a follower that is behind (that comes with
+     * InstallSnapshot on Day 9).
+     *
+     * @return false if nothing new was applied since the last snapshot
+     */
+    public boolean takeSnapshot() {
+        long applied = stateMachine.lastApplied();
+        if (applied <= snapshotIndex) return false;
+        long term = log.termAt(applied).orElseThrow();
+        snapshotStore.save(new Snapshot(applied, term, stateMachine.snapshot()));
+        snapshotIndex = applied;
+
+        long keepFrom = applied;
+        if (role == Role.LEADER) {
+            for (long match : matchIndex.values()) keepFrom = Math.min(keepFrom, match);
+        }
+        if (keepFrom > log.baseIndex()) {
+            log.compactTo(keepFrom, log.termAt(keepFrom).orElseThrow());
+        }
+        return true;
+    }
+
+    private void maybeSnapshot() {
+        int threshold = config.snapshotThreshold();
+        if (threshold > 0 && stateMachine.lastApplied() - snapshotIndex >= threshold) takeSnapshot();
     }
 
     // ---------------------------------------------------------------- time
@@ -219,9 +276,17 @@ public final class RaftNode {
 
     private void sendAppend(NodeId peer) {
         long next = nextIndex.get(peer);
+        List<LogEntry> entries;
+        if (next <= log.baseIndex()) {
+            // The follower needs entries that are only in our snapshot. Until InstallSnapshot
+            // exists, send a bare heartbeat at the base so it still hears from its leader.
+            next = log.baseIndex() + 1;
+            entries = List.of();
+        } else {
+            entries = log.entriesFrom(next, config.maxEntriesPerAppend());
+        }
         long prevIndex = next - 1;
         long prevTerm = log.termAt(prevIndex).orElseThrow();
-        List<LogEntry> entries = log.entriesFrom(next, config.maxEntriesPerAppend());
         transport.send(id, peer,
                 new AppendEntries(term(), id, prevIndex, prevTerm, entries, commitIndex, ++sendSeq));
     }
@@ -294,6 +359,7 @@ public final class RaftNode {
             }
         }
         checkPendingReads();
+        maybeSnapshot();
     }
 
     // ---------------------------------------------------------------- reads
@@ -409,7 +475,7 @@ public final class RaftNode {
         if (prevIndex > log.lastIndex()) return log.lastIndex() + 1;
         long conflictTerm = log.termAt(prevIndex).orElseThrow();
         long i = prevIndex;
-        while (i > 1 && log.termAt(i - 1).orElseThrow() == conflictTerm) i--;
+        while (i > log.baseIndex() + 1 && log.termAt(i - 1).orElseThrow() == conflictTerm) i--;
         return i;
     }
 
@@ -452,6 +518,11 @@ public final class RaftNode {
 
     public long commitIndex() {
         return commitIndex;
+    }
+
+    /** Index of the last entry covered by the latest snapshot, 0 if there is none. */
+    public long snapshotIndex() {
+        return snapshotIndex;
     }
 
     public long lastApplied() {

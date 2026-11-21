@@ -50,6 +50,11 @@ Java 21, Maven, JUnit 5. No frameworks in the core, so the consensus code stays 
   and start it again with an empty state machine. The log is re-applied from the leader's commit
   index. Random runs mix crashes, partitions and message loss, and check every commit as it
   happens.
+- **Snapshots trim the log.** After `snapshotThreshold` applied entries a node saves the state
+  machine to a snapshot file and deletes the log entries it covers. The snapshot is durable first,
+  so a crash in between only leaves a longer log, which is trimmed on startup. A leader keeps the
+  entries a follower has not acknowledged yet; sending a snapshot to a follower that is further
+  behind comes with InstallSnapshot on Day 9.
 - **The log file tells a crash from corruption.** Every record has a length and a CRC32. A
   half-written last record can only come from a crash mid-write, was never acknowledged, and
   is trimmed on startup. A complete record with a bad checksum is real corruption, and the node
@@ -67,7 +72,7 @@ mvn verify
 src/main/java/com/raftkv
 ├── core       NodeId, Role (state machine), Command, LogEntry, PersistentState (term + vote)
 ├── node       RaftNode (election, replication, commit rule, read barrier), RaftConfig, StateStore
-├── storage    FileRaftLog (length + CRC32 records, fsync), FileStateStore (atomic rename)
+├── storage    FileRaftLog (length + CRC32 records, fsync, compaction), FileStateStore, FileSnapshotStore
 ├── kv         KvStateMachine (the map), KvService (put / get / delete as futures)
 ├── log        RaftLog, the shared AppendEntries log rules, in-memory log
 ├── rpc        RequestVote, VoteResponse, AppendEntries, AppendResponse (with fast back-off hint)
@@ -85,7 +90,7 @@ See [docs/PLAN.md](docs/PLAN.md) for the day-by-day plan.
 - [x] Day 5: key-value state machine
 - [x] Day 6: persistent log and state
 - [x] Day 7: crash recovery
-- [ ] Day 8: snapshots and log compaction
+- [x] Day 8: snapshots and log compaction
 - [ ] Day 9: InstallSnapshot
 - [ ] Day 10: HTTP API and node-to-node transport
 - [ ] Day 11: fault-injection harness

@@ -143,4 +143,95 @@ public abstract class RaftLogContractTest {
         assertTrue(log.candidateIsUpToDate(2, 4));
         assertFalse(log.candidateIsUpToDate(2, 2));
     }
+
+    // ------------------------------------------------------------ compaction
+
+    @Test
+    void compactionKeepsLaterEntriesAndAnswersFromTheBase() {
+        seed(1, 1, 2, 2, 3);
+        log.compactTo(3, 2);
+        assertEquals(3, log.baseIndex());
+        assertEquals(2, log.baseTerm());
+        assertEquals(5, log.lastIndex());
+        assertEquals(3, log.lastTerm());
+        assertEquals(Optional.of(2L), log.termAt(3), "the base keeps its term for consistency checks");
+        assertEquals(Optional.of(2L), log.termAt(4));
+        assertTrue(log.termAt(2).isEmpty());
+        assertTrue(log.entry(3).isEmpty());
+        assertTrue(log.entry(4).isPresent());
+        assertEquals(List.of(4L, 5L), log.entriesFrom(4, 10).stream().map(LogEntry::index).toList());
+        assertThrows(IllegalArgumentException.class, () -> log.entriesFrom(3, 10));
+    }
+
+    @Test
+    void appendsContinueAfterCompaction() {
+        seed(1, 1, 2);
+        log.compactTo(3, 2);
+        assertEquals(0, log.entriesFrom(4, 10).size());
+        LogEntry next = log.append(3, Command.put("x", "y"));
+        assertEquals(4, next.index());
+        assertTrue(log.appendFromLeader(4, 3, List.of(e(3, 5))));
+        assertEquals(5, log.lastIndex());
+    }
+
+    @Test
+    void compactingEverythingLeavesTheBaseAsTheLastEntry() {
+        seed(1, 2, 2);
+        log.compactTo(3, 2);
+        assertEquals(3, log.lastIndex());
+        assertEquals(2, log.lastTerm());
+        assertTrue(log.candidateIsUpToDate(2, 3));
+        assertFalse(log.candidateIsUpToDate(2, 2));
+        assertTrue(log.appendFromLeader(3, 2, List.of(e(2, 4))));
+        assertFalse(log.appendFromLeader(4, 1, List.of(e(2, 5))), "wrong prev term still rejected");
+    }
+
+    @Test
+    void compactionBeyondTheEndDropsTheWholeLog() {
+        seed(1, 1);
+        log.compactTo(7, 3);
+        assertEquals(7, log.baseIndex());
+        assertEquals(7, log.lastIndex());
+        assertEquals(3, log.lastTerm());
+        assertTrue(log.entriesFrom(8, 5).isEmpty());
+    }
+
+    @Test
+    void compactionOnADifferentTermDropsTheWholeLog() {
+        seed(1, 3, 3);
+        log.compactTo(2, 2); // snapshot says entry 2 had term 2, but ours had term 3
+        assertEquals(2, log.baseIndex());
+        assertEquals(2, log.lastIndex());
+        assertEquals(2, log.lastTerm(), "entries that disagree with the snapshot are discarded");
+    }
+
+    @Test
+    void compactingToTheCurrentBaseOnlyRecordsTheTerm() {
+        seed(1, 1, 1);
+        log.compactTo(2, 1);
+        log.compactTo(2, 1);
+        assertEquals(3, log.lastIndex());
+        assertThrows(IllegalArgumentException.class, () -> log.compactTo(1, 1));
+    }
+
+    @Test
+    void messageOverlappingTheCompactedPrefixIsAcceptedAndOnlyTheNewPartCounts() {
+        seed(1, 1, 1, 1);
+        log.compactTo(3, 1);
+        // Leader resends from index 2 (older than our base), carrying entries 3, 4 and a new 5.
+        assertTrue(log.appendFromLeader(1, 1, List.of(e(1, 2), e(1, 3), e(1, 4), e(2, 5))));
+        assertEquals(5, log.lastIndex());
+        assertEquals(2, log.lastTerm());
+        // A message that ends inside the compacted part changes nothing.
+        assertTrue(log.appendFromLeader(0, 0, List.of(e(1, 1), e(1, 2))));
+        assertEquals(5, log.lastIndex());
+    }
+
+    @Test
+    void conflictingSuffixAfterCompactionIsTruncatedFromTheRightPlace() {
+        seed(1, 1, 2, 2, 2);
+        log.compactTo(2, 1);
+        assertTrue(log.appendFromLeader(3, 2, List.of(e(3, 4), e(3, 5))));
+        assertArrayEquals(new long[]{2, 3, 3}, log.entriesFrom(3, 10).stream().mapToLong(LogEntry::term).toArray());
+    }
 }

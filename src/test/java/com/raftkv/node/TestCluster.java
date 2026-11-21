@@ -9,6 +9,7 @@ import com.raftkv.kv.KvStateMachine;
 import com.raftkv.log.InMemoryRaftLog;
 import com.raftkv.log.RaftLog;
 import com.raftkv.storage.FileRaftLog;
+import com.raftkv.storage.FileSnapshotStore;
 import com.raftkv.storage.FileStateStore;
 import com.raftkv.transport.InMemoryNetwork;
 
@@ -41,6 +42,7 @@ final class TestCluster {
     final Map<NodeId, RaftNode> nodes = new LinkedHashMap<>();
     final Map<NodeId, StateStore> stores = new HashMap<>();
     final Map<NodeId, RaftLog> logs = new HashMap<>();
+    final Map<NodeId, SnapshotStore> snapshots = new HashMap<>();
     final Set<NodeId> down = new HashSet<>();
     private final List<NodeId> allIds = new ArrayList<>();
     private final Path dataDir;   // null = in-memory nodes that cannot be restarted
@@ -70,6 +72,10 @@ final class TestCluster {
         return new TestCluster(size, seed, RaftConfig.DEFAULT, dataDir, fsync);
     }
 
+    static TestCluster durable(int size, long seed, Path dataDir, RaftConfig config) {
+        return new TestCluster(size, seed, config, dataDir, true);
+    }
+
     private TestCluster(int size, long seed, RaftConfig config, Path dataDir, boolean fsync) {
         this.config = config;
         this.seeds = new Random(seed);
@@ -88,16 +94,20 @@ final class TestCluster {
         peers.remove(id);
         StateStore store;
         RaftLog log;
+        SnapshotStore snapshotStore;
         if (dataDir == null) {
             store = new InMemoryStateStore();
             log = new InMemoryRaftLog();
+            snapshotStore = new InMemorySnapshotStore();
         } else {
             store = new FileStateStore(dataDir.resolve(id.value()).resolve("state"));
             log = new FileRaftLog(logFile(id), fsync);
+            snapshotStore = new FileSnapshotStore(dataDir.resolve(id.value()).resolve("snapshot"));
         }
         stores.put(id, store);
         logs.put(id, log);
-        return newNode(id, peers, store, log);
+        snapshots.put(id, snapshotStore);
+        return newNode(id, peers, store, log, snapshotStore);
     }
 
     /**
@@ -113,6 +123,7 @@ final class TestCluster {
         nodes.remove(id);
         ((FileRaftLog) logs.remove(id)).close();
         stores.remove(id);
+        snapshots.remove(id);
         kvs.remove(id);
         down.add(id);
         if (tornWrite) {
@@ -145,7 +156,8 @@ final class TestCluster {
         for (RaftLog l : logs.values()) if (l instanceof FileRaftLog f) f.close();
     }
 
-    private RaftNode newNode(NodeId id, Set<NodeId> peers, StateStore store, RaftLog log) {
+    private RaftNode newNode(NodeId id, Set<NodeId> peers, StateStore store, RaftLog log,
+                             SnapshotStore snapshotStore) {
         NodeListener recorder = new NodeListener() {
             @Override
             public void roleChanged(NodeId node, Role role, long term) {
@@ -159,7 +171,7 @@ final class TestCluster {
         };
         KvStateMachine kv = new KvStateMachine();
         kvs.put(id, kv);
-        return new RaftNode(id, peers, network, log, store, kv, config,
+        return new RaftNode(id, peers, network, log, store, kv, snapshotStore, config,
                 new Random(seeds.nextLong()), recorder);
     }
 
@@ -174,10 +186,10 @@ final class TestCluster {
     /** Every node has applied the same entries and holds the same map. */
     void assertStateMachinesAgree() {
         long applied = nodes.values().iterator().next().lastApplied();
-        Map<String, String> data = kvs.values().iterator().next().snapshot();
+        Map<String, String> data = kvs.values().iterator().next().contents();
         for (RaftNode n : nodes.values()) {
-            if (n.lastApplied() != applied || !kvs.get(n.id()).snapshot().equals(data)) {
-                throw new AssertionError(n.id() + " applied " + n.lastApplied() + " " + kvs.get(n.id()).snapshot()
+            if (n.lastApplied() != applied || !kvs.get(n.id()).contents().equals(data)) {
+                throw new AssertionError(n.id() + " applied " + n.lastApplied() + " " + kvs.get(n.id()).contents()
                         + " but others applied " + applied + " " + data);
             }
         }
@@ -242,7 +254,7 @@ final class TestCluster {
      */
     private void recordCommitted(RaftNode node, long commitIndex) {
         if (node == null) return; // still constructing
-        for (long i = 1; i <= commitIndex; i++) {
+        for (long i = node.log().baseIndex() + 1; i <= commitIndex; i++) {
             LogEntry mine = node.log().entry(i).orElseThrow(
                     () -> new AssertionError(node.id() + " committed past the end of its log"));
             LogEntry earlier = committed.putIfAbsent(i, mine);
@@ -273,6 +285,7 @@ final class TestCluster {
     void assertCommittedEverywhere() {
         for (RaftNode n : nodes.values()) {
             committed.forEach((i, e) -> {
+                if (i <= n.log().baseIndex()) return; // covered by a snapshot, which is checked by agreement of state
                 if (!n.log().entry(i).equals(Optional.of(e))) {
                     throw new AssertionError(n.id() + " lost committed entry " + e + "; has " + n.log().entry(i));
                 }
@@ -287,9 +300,11 @@ final class TestCluster {
             for (int b = a + 1; b < all.size(); b++) {
                 RaftNode x = all.get(a), y = all.get(b);
                 long upTo = Math.min(x.log().lastIndex(), y.log().lastIndex());
-                for (long i = upTo; i >= 1; i--) {
+                long from = Math.max(x.log().baseIndex(), y.log().baseIndex()) + 1;
+                for (long i = upTo; i >= from; i--) {
                     if (x.log().termAt(i).equals(y.log().termAt(i))) {
-                        if (!x.log().entriesFrom(1, (int) i).equals(y.log().entriesFrom(1, (int) i))) {
+                        int n = (int) (i - from + 1);
+                        if (!x.log().entriesFrom(from, n).equals(y.log().entriesFrom(from, n))) {
                             throw new AssertionError("logs of " + x.id() + " and " + y.id()
                                     + " agree at " + i + " but differ before it");
                         }
